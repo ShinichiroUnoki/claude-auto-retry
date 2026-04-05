@@ -130,14 +130,18 @@ def watch_output(s):
     if len(output_buffer) > 2000:
         output_buffer = output_buffer[-2000:]
         
+    # 色や制御文字（ANSIエスケープ）が混じると正規表現がマッチしないため除去
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    clean_buf = ansi_escape.sub('', output_buffer)
+        
     # パターン0: リセット時刻付き
-    m = re.search(r'(?:Resets at|resets|Resets in)\s+(.+?)(?:\s*\(|·|\||$)', output_buffer)
+    m = re.search(r'(?:Resets at|resets|Resets in)\s+(.+?)(?:\s*\(|·|\||$)', clean_buf, re.IGNORECASE)
     if m:
         # 見つかったら例外を投げてinteractを脱出
         raise RateLimitException(("TIME", m.group(1).strip()))
         
     # パターン1: 汎用Rate Limit
-    m2 = re.search(r'(429 Too Many Requests|rate limit|hit your limit|usage limit|limit reached|5-hour limit)', output_buffer)
+    m2 = re.search(r'(429 Too Many Requests|rate limit|hit your limit|usage limit|limit reached|5-hour limit)', clean_buf, re.IGNORECASE)
     if m2:
         raise RateLimitException(("GENERIC", ""))
         
@@ -231,6 +235,9 @@ def run_claude_with_auto_retry():
                     log("✅ 待機中にプロセスが終了しました。")
                     break
                 
+                # Claudeが /rate-limit-options メニューに入っている可能性を考慮し、Escキーを送って脱出
+                child.send(chr(27)) 
+                time.sleep(0.5)
                 # 待機後、Claudeを再開させる
                 child.send("Continue the task." + chr(13))
                 retry_count += 1
