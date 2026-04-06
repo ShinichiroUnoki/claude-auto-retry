@@ -292,22 +292,18 @@ def run_claude_with_auto_retry():
         try:
             child.expect(r'❯', timeout=30)
             time.sleep(1.0)
-            child.send(initial_prompt)
-            # WHY: ファイルパスを含むプロンプトの場合、Claude Code TUIが
-            # ファイル参照として非同期描画する。描画完了前にEnterを送ると
-            # 送信トリガーとして認識されない。2秒あれば描画が完了する。
-            time.sleep(2.0)
-            child.send(chr(13))
-            time.sleep(0.5)
-            child.send(chr(13))
+            # WHY: child.sendline() は \n (LF) を送る。child.send(chr(13)) は \r (CR) を送る。
+            # Claude Code v2.1.92 の Ink TUI は \r を Enter として認識しない場合がある。
+            # sendline() + sendline("") の組み合わせで確実に送信する。
+            child.sendline(initial_prompt)
+            time.sleep(1.0)
+            child.sendline("")
             log("📤 初回プロンプトを送信しました。")
         except pexpect.TIMEOUT:
             log("⚠️ 起動待機中にタイムアウト。プロンプトを直接送信します。")
-            child.send(initial_prompt)
-            time.sleep(2.0)
-            child.send(chr(13))
-            time.sleep(0.5)
-            child.send(chr(13))
+            child.sendline(initial_prompt)
+            time.sleep(1.0)
+            child.sendline("")
 
     # WHY: expect()後にpexpect内部バッファに残ったデータを画面に出す。
     # 自前I/Oループに切り替えるとpexpectのバッファは読まれなくなるため。
@@ -370,12 +366,10 @@ def run_claude_with_auto_retry():
                 time.sleep(1.5)
 
                 # WHY: ESCと"C"の間隔が短いと、ターミナルがESCシーケンス(\x1BC)として
-                # 解釈し、"C"が消失する。初回プロンプトと同じ段階的送信方式を使う。
-                child.send("Continue the task.")
+                # 解釈し、"C"が消失する。sendline()で\nを使い確実に送信する。
+                child.sendline("Continue the task.")
                 time.sleep(0.5)
-                child.send(chr(13))
-                time.sleep(0.5)
-                child.send(chr(13))
+                child.sendline("")
                 retry_count += 1
                 log(f"🔄 復旧指示を送信しました。（リトライ #{retry_count}/{MAX_RETRIES}）")
 
