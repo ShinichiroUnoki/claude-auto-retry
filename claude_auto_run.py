@@ -107,6 +107,21 @@ def wait_and_log(seconds: int, retry_count: int) -> None:
     time.sleep(seconds)
 
 
+def send_enter(child) -> None:
+    """
+    PTYのline discipline状態に関わらずEnterを確実に送信する。
+
+    WHY: PTYのデフォルト設定(ICRNL=ON)では \\r が \\n に変換される。
+    Claude CodeのInk TUIがraw modeを設定した後は \\r がそのまま通過する。
+    ❯ 表示時点でどちらの状態かは不確定なため、\\r と \\n の両方を送る。
+    - ICRNL=ON  (デフォルト): \\r→\\n になり、追加の \\n と合わせて2つのLFが届く
+    - ICRNL=OFF (raw mode):   \\r はCRとして届き、Ink がEnterとして認識する
+    """
+    os.write(child.child_fd, b'\r')
+    time.sleep(0.05)
+    os.write(child.child_fd, b'\n')
+
+
 # ==========================================
 # SIGWINCH転送
 # ==========================================
@@ -292,18 +307,31 @@ def run_claude_with_auto_retry():
         try:
             child.expect(r'❯', timeout=30)
             time.sleep(1.0)
-            # WHY: child.sendline() は \n (LF) を送る。child.send(chr(13)) は \r (CR) を送る。
-            # Claude Code v2.1.92 の Ink TUI は \r を Enter として認識しない場合がある。
-            # sendline() + sendline("") の組み合わせで確実に送信する。
-            child.sendline(initial_prompt)
-            time.sleep(1.0)
-            child.sendline("")
+            child.send(initial_prompt)
+            time.sleep(0.5)
+            send_enter(child)  # Enter 1: 改行
+            time.sleep(0.5)
+            send_enter(child)  # Enter 2: 空行で送信
+            time.sleep(2.0)
+
+            # 送信確認: ❯ が再表示された場合は送信失敗 → リトライ
+            try:
+                child.expect(r'❯', timeout=3)
+                log("⚠️ プロンプト送信に失敗。リトライ中...")
+                send_enter(child)
+                time.sleep(0.5)
+                send_enter(child)
+            except pexpect.TIMEOUT:
+                pass  # ❯が出ない = 送信成功、Claudeが処理中
+
             log("📤 初回プロンプトを送信しました。")
         except pexpect.TIMEOUT:
             log("⚠️ 起動待機中にタイムアウト。プロンプトを直接送信します。")
-            child.sendline(initial_prompt)
-            time.sleep(1.0)
-            child.sendline("")
+            child.send(initial_prompt)
+            time.sleep(0.5)
+            send_enter(child)
+            time.sleep(0.5)
+            send_enter(child)
 
     # WHY: expect()後にpexpect内部バッファに残ったデータを画面に出す。
     # 自前I/Oループに切り替えるとpexpectのバッファは読まれなくなるため。
@@ -366,10 +394,12 @@ def run_claude_with_auto_retry():
                 time.sleep(1.5)
 
                 # WHY: ESCと"C"の間隔が短いと、ターミナルがESCシーケンス(\x1BC)として
-                # 解釈し、"C"が消失する。sendline()で\nを使い確実に送信する。
-                child.sendline("Continue the task.")
+                # 解釈し、"C"が消失する。1.5秒の間隔で回避。
+                child.send("Continue the task.")
                 time.sleep(0.5)
-                child.sendline("")
+                send_enter(child)
+                time.sleep(0.5)
+                send_enter(child)
                 retry_count += 1
                 log(f"🔄 復旧指示を送信しました。（リトライ #{retry_count}/{MAX_RETRIES}）")
 
