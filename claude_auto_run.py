@@ -358,13 +358,15 @@ def run_claude_with_auto_retry():
                     break
 
                 # WHY: Claude Code は Rate Limit 時にメニューを表示する。
-                # ESCを2回送ることでメニュー状態から確実に抜ける。
+                # ESCでメニュー状態から抜ける。
                 child.send(chr(27))
-                time.sleep(1.0)
-                child.send(chr(27))
-                time.sleep(0.5)
+                time.sleep(1.5)
 
-                child.send("Continue the task." + chr(13))
+                # WHY: ESCと"C"の間隔が短いと、ターミナルがESCシーケンス(\x1BC)として
+                # 解釈し、"C"が消失する。初回プロンプトと同じ段階的送信方式を使う。
+                child.send("Continue the task.")
+                time.sleep(0.5)
+                child.send(chr(13))
                 time.sleep(0.5)
                 child.send(chr(13))
                 retry_count += 1
