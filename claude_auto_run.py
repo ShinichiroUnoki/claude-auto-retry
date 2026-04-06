@@ -293,14 +293,21 @@ def run_claude_with_auto_retry():
             child.expect(r'❯', timeout=30)
             time.sleep(1.0)
             child.send(initial_prompt)
-            time.sleep(0.5)
+            # WHY: ファイルパスを含むプロンプトの場合、Claude Code TUIが
+            # ファイル参照として非同期描画する。描画完了前にEnterを送ると
+            # 送信トリガーとして認識されない。2秒あれば描画が完了する。
+            time.sleep(2.0)
             child.send(chr(13))
             time.sleep(0.5)
             child.send(chr(13))
             log("📤 初回プロンプトを送信しました。")
         except pexpect.TIMEOUT:
             log("⚠️ 起動待機中にタイムアウト。プロンプトを直接送信します。")
-            child.send(initial_prompt + chr(13))
+            child.send(initial_prompt)
+            time.sleep(2.0)
+            child.send(chr(13))
+            time.sleep(0.5)
+            child.send(chr(13))
 
     # WHY: expect()後にpexpect内部バッファに残ったデータを画面に出す。
     # 自前I/Oループに切り替えるとpexpectのバッファは読まれなくなるため。
