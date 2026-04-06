@@ -1,10 +1,11 @@
 """
-Claude Code 自動復旧スクリプト v3.2
+Claude Code 自動復旧スクリプト v3.3
 select() ベースの自前I/Oループで、TUI対話とRate Limit自動復旧を両立する。
 
 アーキテクチャ:
   interactive_loop() → select([child_fd, stdin_fd], timeout=0.5)
     ├─ child_fd ready  → read → check_rate_limit → write to stdout
+    │                    → detect ❯ → inject pending prompt
     ├─ stdin_fd ready  → read → write to child_fd
     └─ timeout         → if rate_limit_detected: return
 """
@@ -44,7 +45,6 @@ RATE_LIMIT_GENERIC_RE = re.compile(
     re.IGNORECASE
 )
 
-# 2段階フィルタ用: フルバッファ検査を省略するための軽量キーワード
 _RATE_LIMIT_KEYWORDS = ('rate', 'limit', '429', 'resets', 'hit your')
 
 # ==========================================
@@ -52,13 +52,12 @@ _RATE_LIMIT_KEYWORDS = ('rate', 'limit', '429', 'resets', 'hit your')
 # ==========================================
 
 _rate_limit_detected = False
-_rate_limit_type = None   # "TIME" or "GENERIC"
+_rate_limit_type = None
 _rate_limit_value = ""
 _output_buffer = ""
 
 
 def reset_rate_limit_state():
-    """Rate Limit検知の内部状態をリセットする。"""
     global _rate_limit_detected, _rate_limit_type, _rate_limit_value, _output_buffer
     _rate_limit_detected = False
     _rate_limit_type = None
@@ -107,27 +106,11 @@ def wait_and_log(seconds: int, retry_count: int) -> None:
     time.sleep(seconds)
 
 
-def send_enter(child) -> None:
-    """
-    PTYのline discipline状態に関わらずEnterを確実に送信する。
-
-    WHY: PTYのデフォルト設定(ICRNL=ON)では \\r が \\n に変換される。
-    Claude CodeのInk TUIがraw modeを設定した後は \\r がそのまま通過する。
-    ❯ 表示時点でどちらの状態かは不確定なため、\\r と \\n の両方を送る。
-    - ICRNL=ON  (デフォルト): \\r→\\n になり、追加の \\n と合わせて2つのLFが届く
-    - ICRNL=OFF (raw mode):   \\r はCRとして届き、Ink がEnterとして認識する
-    """
-    os.write(child.child_fd, b'\r')
-    time.sleep(0.05)
-    os.write(child.child_fd, b'\n')
-
-
 # ==========================================
 # SIGWINCH転送
 # ==========================================
 
 def _sync_terminal_size(child):
-    """親ターミナルのサイズを子プロセスに同期する。"""
     try:
         size = shutil.get_terminal_size()
         child.setwinsize(size.lines, size.columns)
@@ -197,8 +180,6 @@ def check_rate_limit(data_bytes):
 
     text = data_bytes.decode('utf-8', errors='replace')
 
-    # 2段階フィルタ: 新チャンクにキーワードが含まれない場合はフルバッファ検査を省略
-    # WHY: select()ループは高頻度で回るため、毎回2000文字のANSI strip + regexは無駄
     text_lower = text.lower()
     needs_full_check = any(kw in text_lower for kw in _RATE_LIMIT_KEYWORDS)
 
@@ -226,15 +207,21 @@ def check_rate_limit(data_bytes):
 
 
 # ==========================================
-# 自前 I/O ループ
+# 自前 I/O ループ（プロンプト注入機能付き）
 # ==========================================
 
-def interactive_loop(child):
+def interactive_loop(child, pending_prompt=None):
     """
     pexpect.interact() の代替。select() + タイムアウトで対話とRate Limit検知を両立する。
 
-    WHY: pexpect.interact()は内部のselect()ループに外部から介入できない設計のため、
-    Rate Limit検知時に安全にループを脱出する手段がない。
+    pending_prompt が指定された場合、TUI出力内で ❯ を検知した時点で
+    プロンプトを自動注入する。
+
+    WHY: pexpect.expect() でプロンプトを送信するアプローチでは、
+    Claude Code TUIの入力ハンドラ初期化完了前にキーが送られて
+    Enterが認識されない問題が発生した。
+    interactive_loop内で ❯ を検知してから送信することで、
+    TUIが確実にready状態の時にのみキー入力を行う。
 
     Returns:
         "RATE_LIMIT" or "EXIT"
@@ -243,6 +230,11 @@ def interactive_loop(child):
     child_fd = child.child_fd
     stdout_fd = sys.stdout.fileno()
 
+    prompt_injected = False
+    # WHY: ❯ 検知後すぐに送信するのではなく、TUIの描画完了を待つ。
+    # ❯ を検知してからのフレーム数をカウントし、安定を確認してから送信する。
+    prompt_ready_counter = -1  # -1 = ❯ 未検知
+
     old_settings = termios.tcgetattr(stdin_fd)
     try:
         tty.setraw(stdin_fd)
@@ -250,6 +242,21 @@ def interactive_loop(child):
         while child.isalive():
             if _rate_limit_detected:
                 return "RATE_LIMIT"
+
+            # 初回プロンプト注入: ❯ 検知後に数フレーム待ってから送信
+            if pending_prompt and not prompt_injected and prompt_ready_counter >= 0:
+                prompt_ready_counter += 1
+                # WHY: ❯ 検知後、3回のselect()サイクル(約1.5秒)待つことで、
+                # TUIの非同期初期化（stdin raw mode設定、input handler登録）が
+                # 確実に完了してからキー入力を送る。
+                if prompt_ready_counter >= 3:
+                    os.write(child_fd, pending_prompt.encode('utf-8'))
+                    time.sleep(0.3)
+                    os.write(child_fd, b'\r')
+                    time.sleep(0.3)
+                    os.write(child_fd, b'\r')
+                    prompt_injected = True
+                    log("📤 初回プロンプトを送信しました。")
 
             try:
                 r, _, _ = select.select([child_fd, stdin_fd], [], [], SELECT_TIMEOUT)
@@ -268,6 +275,13 @@ def interactive_loop(child):
                     return "EXIT"
 
                 check_rate_limit(data)
+
+                # 初回プロンプト: TUI出力内で ❯ を検知したらカウンタ開始
+                if pending_prompt and not prompt_injected and prompt_ready_counter < 0:
+                    clean = ANSI_ESCAPE_RE.sub('', data.decode('utf-8', errors='replace'))
+                    if '❯' in clean:
+                        prompt_ready_counter = 0
+
                 os.write(stdout_fd, data)
 
             if stdin_fd in r:
@@ -293,7 +307,7 @@ def interactive_loop(child):
 def run_claude_with_auto_retry():
     cmd, initial_prompt = parse_args()
 
-    log(f"🚀 [Claude Auto-Recovery v3.2] Starting: {cmd}")
+    log(f"🚀 [Claude Auto-Recovery v3.3] Starting: {cmd}")
     if initial_prompt:
         log(f"📝 初回プロンプト: {initial_prompt[:80]}...")
 
@@ -302,54 +316,18 @@ def run_claude_with_auto_retry():
 
     retry_count = 0
 
-    # 初回プロンプトの自動送信
-    if initial_prompt:
-        try:
-            child.expect(r'❯', timeout=30)
-            time.sleep(1.0)
-            child.send(initial_prompt)
-            time.sleep(0.5)
-            send_enter(child)  # Enter 1: 改行
-            time.sleep(0.5)
-            send_enter(child)  # Enter 2: 空行で送信
-            time.sleep(2.0)
-
-            # 送信確認: ❯ が再表示された場合は送信失敗 → リトライ
-            try:
-                child.expect(r'❯', timeout=3)
-                log("⚠️ プロンプト送信に失敗。リトライ中...")
-                send_enter(child)
-                time.sleep(0.5)
-                send_enter(child)
-            except pexpect.TIMEOUT:
-                pass  # ❯が出ない = 送信成功、Claudeが処理中
-
-            log("📤 初回プロンプトを送信しました。")
-        except pexpect.TIMEOUT:
-            log("⚠️ 起動待機中にタイムアウト。プロンプトを直接送信します。")
-            child.send(initial_prompt)
-            time.sleep(0.5)
-            send_enter(child)
-            time.sleep(0.5)
-            send_enter(child)
-
-    # WHY: expect()後にpexpect内部バッファに残ったデータを画面に出す。
-    # 自前I/Oループに切り替えるとpexpectのバッファは読まれなくなるため。
-    try:
-        remaining = child.before or ""
-        if remaining and isinstance(remaining, str):
-            sys.stdout.write(remaining)
-            sys.stdout.flush()
-    except Exception:
-        pass
-
     # 監視・対話・復旧ループ
+    # WHY: 初回プロンプトは interactive_loop 内で ❯ 検知後に注入する。
+    # pexpect.expect() で事前送信するとTUI初期化完了前にキーが届き、
+    # Enterが認識されない問題が発生するため。
     try:
         while retry_count < MAX_RETRIES:
             reset_rate_limit_state()
 
             try:
-                result = interactive_loop(child)
+                # 初回のみ pending_prompt を渡す（注入後はNoneになる）
+                prompt_to_send = initial_prompt if retry_count == 0 else None
+                result = interactive_loop(child, pending_prompt=prompt_to_send)
 
                 if result == "EXIT":
                     log("✅ プロセスが正常終了またはユーザーによって切断されました。")
@@ -390,18 +368,13 @@ def run_claude_with_auto_retry():
 
                 # WHY: Claude Code は Rate Limit 時にメニューを表示する。
                 # ESCでメニュー状態から抜ける。
-                child.send(chr(27))
+                os.write(child.child_fd, b'\x1b')
                 time.sleep(1.5)
 
-                # WHY: ESCと"C"の間隔が短いと、ターミナルがESCシーケンス(\x1BC)として
-                # 解釈し、"C"が消失する。1.5秒の間隔で回避。
-                child.send("Continue the task.")
-                time.sleep(0.5)
-                send_enter(child)
-                time.sleep(0.5)
-                send_enter(child)
+                # 復旧プロンプトを次のループで interactive_loop 経由で注入
+                initial_prompt = "Continue the task."
                 retry_count += 1
-                log(f"🔄 復旧指示を送信しました。（リトライ #{retry_count}/{MAX_RETRIES}）")
+                log(f"🔄 復旧準備完了。（リトライ #{retry_count}/{MAX_RETRIES}）")
 
             except KeyboardInterrupt:
                 log("\n🛑 ユーザーによって手動で停止されました(Ctrl+C)。")
