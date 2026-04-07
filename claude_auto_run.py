@@ -315,9 +315,11 @@ def run_claude_with_auto_retry():
     setup_sigwinch_handler(child)
 
     retry_count = 0
+    # 次にinteractive_loopに渡すプロンプト（初回 or 復旧用）
+    next_prompt = initial_prompt
 
     # 監視・対話・復旧ループ
-    # WHY: 初回プロンプトは interactive_loop 内で ❯ 検知後に注入する。
+    # WHY: プロンプトは interactive_loop 内で ❯ 検知後に注入する。
     # pexpect.expect() で事前送信するとTUI初期化完了前にキーが届き、
     # Enterが認識されない問題が発生するため。
     try:
@@ -325,9 +327,8 @@ def run_claude_with_auto_retry():
             reset_rate_limit_state()
 
             try:
-                # 初回のみ pending_prompt を渡す（注入後はNoneになる）
-                prompt_to_send = initial_prompt if retry_count == 0 else None
-                result = interactive_loop(child, pending_prompt=prompt_to_send)
+                result = interactive_loop(child, pending_prompt=next_prompt)
+                next_prompt = None  # 注入済みならクリア
 
                 if result == "EXIT":
                     log("✅ プロセスが正常終了またはユーザーによって切断されました。")
@@ -371,8 +372,8 @@ def run_claude_with_auto_retry():
                 os.write(child.child_fd, b'\x1b')
                 time.sleep(1.5)
 
-                # 復旧プロンプトを次のループで interactive_loop 経由で注入
-                initial_prompt = "Continue the task."
+                # 次のinteractive_loopで ❯ 検知後に復旧プロンプトを注入する
+                next_prompt = "Continue the task."
                 retry_count += 1
                 log(f"🔄 復旧準備完了。（リトライ #{retry_count}/{MAX_RETRIES}）")
 
