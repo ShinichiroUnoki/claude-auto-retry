@@ -44,7 +44,7 @@ AUTO_APPROVE_MSG = "/compact はい、承認します。全て自動判断で最
 ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 # 自律実行指示（全プロンプトの末尾に付加）
-AUTONOMOUS_SUFFIX = " 承認確認は不要です。全て自動判断で最後まで進めてください。"
+AUTONOMOUS_SUFFIX = "/compact 承認確認は不要です。全て自動判断で最後まで進めてください。"
 
 # パーミッションダイアログ検知用キーワード
 _PERMISSION_KEYWORDS = ('do you want to proceed', 'requested permissions')
