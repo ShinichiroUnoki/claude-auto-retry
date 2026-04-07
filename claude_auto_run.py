@@ -54,6 +54,9 @@ RATE_LIMIT_GENERIC_RE = re.compile(
 
 _RATE_LIMIT_KEYWORDS = ('rate', 'limit', '429', 'resets', 'hit your')
 
+# パーミッションダイアログ検知用キーワード
+_PERMISSION_KEYWORDS = ('do you want to proceed', 'requested permissions')
+
 # 自律実行指示（全プロンプトの末尾に付加）
 AUTONOMOUS_SUFFIX = " 承認確認は不要です。全て自動判断で最後まで進めてください。"
 
@@ -305,6 +308,16 @@ def interactive_loop(child, pending_prompt=None):
                 check_rate_limit(data)
 
                 clean = ANSI_ESCAPE_RE.sub('', data.decode('utf-8', errors='replace'))
+                clean_lower = clean.lower()
+
+                # --- パーミッションダイアログの自動承認 ---
+                # WHY: --dangerously-skip-permissions でも "sensitive file" 系の
+                # パーミッション確認は表示される。メニュー形式（1. Yes / 2. ... / 3. No）
+                # なのでEnterキーのみ送信してデフォルト選択（Yes）を実行する。
+                if any(kw in clean_lower for kw in _PERMISSION_KEYWORDS):
+                    log("🔓 パーミッション確認を自動承認")
+                    time.sleep(0.5)
+                    os.write(child_fd, b'\r')
 
                 # Phase 1: 初回 ❯ 検知 → プロンプト注入準備
                 if pending_prompt and not prompt_injected and prompt_ready_counter < 0:
@@ -316,7 +329,6 @@ def interactive_loop(child, pending_prompt=None):
                     auto_approve_idle_cycles = 1  # カウント開始
 
                 # 出力があったらアイドルカウントをリセット
-                # WHY: ❯ を含まない通常出力が来た場合、Claudeはまだ処理中
                 if auto_approve_idle_cycles > 0 and '❯' not in clean and len(clean.strip()) > 0:
                     auto_approve_idle_cycles = 0
 
