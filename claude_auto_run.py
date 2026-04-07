@@ -312,12 +312,18 @@ def interactive_loop(child, pending_prompt=None):
 # メインループ
 # ==========================================
 
+DEFAULT_RECOVERY_PROMPT = "/session-recover /assemble-team"
+
+
 def run_claude_with_auto_retry():
     cmd, initial_prompt = parse_args()
 
+    if not initial_prompt:
+        initial_prompt = DEFAULT_RECOVERY_PROMPT
+        log(f"📝 -p 未指定。デフォルトプロンプト: {initial_prompt}")
+
     log(f"🚀 [Claude Auto-Recovery v3.3] Starting: {cmd}")
-    if initial_prompt:
-        log(f"📝 初回プロンプト: {initial_prompt[:80]}...")
+    log(f"📝 初回プロンプト: {initial_prompt[:80]}...")
 
     child = pexpect.spawn(cmd[0], cmd[1:], encoding='utf-8', timeout=None)
     setup_sigwinch_handler(child)
