@@ -51,6 +51,13 @@ RATE_LIMIT_GENERIC_RE = re.compile(
     r'(429 Too Many Requests|rate limit|hit your limit|usage limit|limit reached|5-hour limit)',
     re.IGNORECASE
 )
+# WHY: ステータスバーの「You've used 90% of your session limit · resets 8pm」は
+# rate limitではなく使用率の表示。これを誤検知しないように除外する。
+# "resets Xpm" 部分まで含めて除去しないと、残った "resets 8pm" がTIMEパターンに誤マッチする。
+USAGE_PERCENT_RE = re.compile(
+    r"you've used \d+%\s+of your session limit[^\n]*",
+    re.IGNORECASE
+)
 
 _RATE_LIMIT_KEYWORDS = ('rate', 'limit', '429', 'resets', 'hit your')
 
@@ -209,14 +216,18 @@ def check_rate_limit(data_bytes):
 
     clean_buf = ANSI_ESCAPE_RE.sub('', _output_buffer)
 
-    m = RATE_LIMIT_TIME_RE.search(clean_buf)
+    # WHY: ステータスバーの使用率表示（例: "You've used 90% of your session limit · resets 8pm"）
+    # に含まれる "resets 8pm" を誤検知しないよう、使用率表示行を除外してからパターンマッチする。
+    clean_buf_filtered = USAGE_PERCENT_RE.sub('', clean_buf)
+
+    m = RATE_LIMIT_TIME_RE.search(clean_buf_filtered)
     if m:
         _rate_limit_type = "TIME"
         _rate_limit_value = m.group(1).strip()
         _rate_limit_detected = True
         return
 
-    m2 = RATE_LIMIT_GENERIC_RE.search(clean_buf)
+    m2 = RATE_LIMIT_GENERIC_RE.search(clean_buf_filtered)
     if m2:
         _rate_limit_type = "GENERIC"
         _rate_limit_value = ""

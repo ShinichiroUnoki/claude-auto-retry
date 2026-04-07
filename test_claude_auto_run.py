@@ -209,6 +209,32 @@ class TestCheckRateLimit:
         assert car._rate_limit_value == ""
         assert car._output_buffer == ""
 
+    def test_usage_percent_not_detected(self):
+        """ステータスバーの使用率表示を誤検知しない"""
+        car.check_rate_limit(
+            b"You've used 90% of your session limit \xc2\xb7 resets 8pm (Asia/Tokyo)"
+        )
+        assert car._rate_limit_detected is False
+
+    def test_usage_percent_50_not_detected(self):
+        """50%の使用率表示を誤検知しない"""
+        car.check_rate_limit(
+            b"You've used 50% of your session limit \xc2\xb7 resets 8pm"
+        )
+        assert car._rate_limit_detected is False
+
+    def test_real_rate_limit_still_detected_after_percent(self):
+        """使用率表示の後に本当のrate limitが来た場合は検知する"""
+        car.check_rate_limit(
+            b"You've used 90% of your session limit \xc2\xb7 resets 8pm"
+        )
+        assert car._rate_limit_detected is False
+        # バッファをリセットして本物のrate limitを送信
+        car.reset_rate_limit_state()
+        car.check_rate_limit(b"You've hit your limit - resets 8pm")
+        assert car._rate_limit_detected is True
+        assert car._rate_limit_type == "TIME"
+
 
 # ==========================================
 # parse_args: 引数パース
