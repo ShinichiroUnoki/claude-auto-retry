@@ -1,11 +1,13 @@
 """
-Claude Code 自動復旧スクリプト v3.3
+Claude Code 自動復旧スクリプト v3.4
 select() ベースの自前I/Oループで、TUI対話とRate Limit自動復旧を両立する。
+Claudeが承認を求めて停止した場合も自動応答して作業を完遂させる。
 
 アーキテクチャ:
   interactive_loop() → select([child_fd, stdin_fd], timeout=0.5)
     ├─ child_fd ready  → read → check_rate_limit → write to stdout
     │                    → detect ❯ → inject pending prompt
+    │                    → detect ❯ (再出現) → auto-approve
     ├─ stdin_fd ready  → read → write to child_fd
     └─ timeout         → if rate_limit_detected: return
 """
@@ -35,6 +37,11 @@ BACKOFF_MAX_SECONDS = 600
 # WHY: 短すぎるとCPU消費が増え、長すぎるとRate Limit検知の反応が遅れる
 SELECT_TIMEOUT = 0.5
 
+# WHY: プロンプト注入後、Claudeが承認を求めて ❯ を再表示した場合に自動応答する。
+# 連続自動応答の上限を設けて無限ループを防止する。
+MAX_AUTO_APPROVALS = 5
+AUTO_APPROVE_MSG = "はい、承認します。全て自動判断で最後まで進めてください。確認は不要です。"
+
 ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 RATE_LIMIT_TIME_RE = re.compile(
     r'(?:Resets at|resets|Resets in)\s+(.+?)(?:\s*\(|·|\||$)',
@@ -46,6 +53,9 @@ RATE_LIMIT_GENERIC_RE = re.compile(
 )
 
 _RATE_LIMIT_KEYWORDS = ('rate', 'limit', '429', 'resets', 'hit your')
+
+# 自律実行指示（全プロンプトの末尾に付加）
+AUTONOMOUS_SUFFIX = " 承認確認は不要です。全て自動判断で最後まで進めてください。"
 
 # ==========================================
 # Rate Limit 検知状態
@@ -88,15 +98,11 @@ def calc_wait_seconds(reset_time_str: str) -> int:
             if reset_time <= now:
                 elapsed = (now - reset_time).total_seconds()
                 if elapsed < 3600:
-                    # WHY: リセット時刻が直近1時間以内の過去 → 既にリセット済み。
-                    # 例: 現在3:01pm、リセット3pm → 60秒待ってリトライすれば十分。
                     log(f"🕐 リセット時刻 {reset_time_str} は{int(elapsed)}秒前に通過済み。短時間待機で再試行。")
                     return 60
-                # 1時間以上前 → 翌日のリセットと解釈
                 reset_time += timedelta(days=1)
 
             diff = int((reset_time - now).total_seconds())
-            # マージン60秒を追加、最大4時間でキャップ
             return min(diff + 60, 14400)
         except ValueError:
             continue
@@ -215,7 +221,7 @@ def check_rate_limit(data_bytes):
 
 
 # ==========================================
-# 自前 I/O ループ（プロンプト注入機能付き）
+# 自前 I/O ループ（プロンプト注入 + 自動応答機能付き）
 # ==========================================
 
 def interactive_loop(child, pending_prompt=None):
@@ -223,13 +229,8 @@ def interactive_loop(child, pending_prompt=None):
     pexpect.interact() の代替。select() + タイムアウトで対話とRate Limit検知を両立する。
 
     pending_prompt が指定された場合、TUI出力内で ❯ を検知した時点で
-    プロンプトを自動注入する。
-
-    WHY: pexpect.expect() でプロンプトを送信するアプローチでは、
-    Claude Code TUIの入力ハンドラ初期化完了前にキーが送られて
-    Enterが認識されない問題が発生した。
-    interactive_loop内で ❯ を検知してから送信することで、
-    TUIが確実にready状態の時にのみキー入力を行う。
+    プロンプトを自動注入する。注入後に ❯ が再出現した場合は、
+    Claudeが承認を求めて停止したと判断し、自動応答を送信する。
 
     Returns:
         "RATE_LIMIT" or "EXIT"
@@ -239,9 +240,14 @@ def interactive_loop(child, pending_prompt=None):
     stdout_fd = sys.stdout.fileno()
 
     prompt_injected = False
-    # WHY: ❯ 検知後すぐに送信するのではなく、TUIの描画完了を待つ。
-    # ❯ を検知してからのフレーム数をカウントし、安定を確認してから送信する。
     prompt_ready_counter = -1  # -1 = ❯ 未検知
+
+    # 自動応答: プロンプト注入後に ❯ が再出現した場合の処理
+    auto_approve_count = 0
+    # WHY: ❯ 検知後すぐに応答せず、Claudeが完全に出力を終えるまで待つ。
+    # 処理中の中間出力に ❯ が含まれる場合の誤検知を防ぐ。
+    auto_approve_idle_cycles = 0
+    IDLE_THRESHOLD = 6  # 3秒間(0.5秒×6)出力がなければ「入力待ち」と判断
 
     old_settings = termios.tcgetattr(stdin_fd)
     try:
@@ -251,20 +257,34 @@ def interactive_loop(child, pending_prompt=None):
             if _rate_limit_detected:
                 return "RATE_LIMIT"
 
-            # 初回プロンプト注入: ❯ 検知後に数フレーム待ってから送信
+            # --- Phase 1: 初回プロンプト注入 ---
             if pending_prompt and not prompt_injected and prompt_ready_counter >= 0:
                 prompt_ready_counter += 1
-                # WHY: ❯ 検知後、3回のselect()サイクル(約1.5秒)待つことで、
-                # TUIの非同期初期化（stdin raw mode設定、input handler登録）が
-                # 確実に完了してからキー入力を送る。
                 if prompt_ready_counter >= 3:
-                    os.write(child_fd, pending_prompt.encode('utf-8'))
+                    full_prompt = pending_prompt + AUTONOMOUS_SUFFIX
+                    os.write(child_fd, full_prompt.encode('utf-8'))
                     time.sleep(0.3)
                     os.write(child_fd, b'\r')
                     time.sleep(0.3)
                     os.write(child_fd, b'\r')
                     prompt_injected = True
-                    log("📤 初回プロンプトを送信しました。")
+                    log("📤 プロンプトを送信しました。")
+
+            # --- Phase 2: 自動応答（Claudeが承認待ちで停止した場合） ---
+            if prompt_injected and auto_approve_idle_cycles > 0:
+                auto_approve_idle_cycles += 1
+                if auto_approve_idle_cycles >= IDLE_THRESHOLD:
+                    if auto_approve_count < MAX_AUTO_APPROVALS:
+                        auto_approve_count += 1
+                        log(f"🤖 自動応答 #{auto_approve_count}: Claudeが入力待ちのため承認を送信")
+                        os.write(child_fd, AUTO_APPROVE_MSG.encode('utf-8'))
+                        time.sleep(0.3)
+                        os.write(child_fd, b'\r')
+                        time.sleep(0.3)
+                        os.write(child_fd, b'\r')
+                    else:
+                        log(f"⚠️ 自動応答上限({MAX_AUTO_APPROVALS}回)に達しました。手動入力をお待ちします。")
+                    auto_approve_idle_cycles = 0
 
             try:
                 r, _, _ = select.select([child_fd, stdin_fd], [], [], SELECT_TIMEOUT)
@@ -284,13 +304,28 @@ def interactive_loop(child, pending_prompt=None):
 
                 check_rate_limit(data)
 
-                # 初回プロンプト: TUI出力内で ❯ を検知したらカウンタ開始
+                clean = ANSI_ESCAPE_RE.sub('', data.decode('utf-8', errors='replace'))
+
+                # Phase 1: 初回 ❯ 検知 → プロンプト注入準備
                 if pending_prompt and not prompt_injected and prompt_ready_counter < 0:
-                    clean = ANSI_ESCAPE_RE.sub('', data.decode('utf-8', errors='replace'))
                     if '❯' in clean:
                         prompt_ready_counter = 0
 
+                # Phase 2: プロンプト注入済みで ❯ 再出現 → 自動応答カウント開始
+                if prompt_injected and '❯' in clean:
+                    auto_approve_idle_cycles = 1  # カウント開始
+
+                # 出力があったらアイドルカウントをリセット
+                # WHY: ❯ を含まない通常出力が来た場合、Claudeはまだ処理中
+                if auto_approve_idle_cycles > 0 and '❯' not in clean and len(clean.strip()) > 0:
+                    auto_approve_idle_cycles = 0
+
                 os.write(stdout_fd, data)
+
+            else:
+                # child_fd からの出力がない（タイムアウト）→ アイドルサイクル加算
+                # WHY: ❯ 検知後に出力が止まった = Claudeがユーザー入力を待っている
+                pass
 
             if stdin_fd in r:
                 try:
@@ -300,6 +335,8 @@ def interactive_loop(child, pending_prompt=None):
                 if not data:
                     return "EXIT"
 
+                # ユーザーが手動入力したら自動応答カウントをリセット
+                auto_approve_idle_cycles = 0
                 os.write(child_fd, data)
 
         return "EXIT"
@@ -322,27 +359,22 @@ def run_claude_with_auto_retry():
         initial_prompt = DEFAULT_RECOVERY_PROMPT
         log(f"📝 -p 未指定。デフォルトプロンプト: {initial_prompt}")
 
-    log(f"🚀 [Claude Auto-Recovery v3.3] Starting: {cmd}")
+    log(f"🚀 [Claude Auto-Recovery v3.4] Starting: {cmd}")
     log(f"📝 初回プロンプト: {initial_prompt[:80]}...")
 
     child = pexpect.spawn(cmd[0], cmd[1:], encoding='utf-8', timeout=None)
     setup_sigwinch_handler(child)
 
     retry_count = 0
-    # 次にinteractive_loopに渡すプロンプト（初回 or 復旧用）
     next_prompt = initial_prompt
 
-    # 監視・対話・復旧ループ
-    # WHY: プロンプトは interactive_loop 内で ❯ 検知後に注入する。
-    # pexpect.expect() で事前送信するとTUI初期化完了前にキーが届き、
-    # Enterが認識されない問題が発生するため。
     try:
         while retry_count < MAX_RETRIES:
             reset_rate_limit_state()
 
             try:
                 result = interactive_loop(child, pending_prompt=next_prompt)
-                next_prompt = None  # 注入済みならクリア
+                next_prompt = None
 
                 if result == "EXIT":
                     log("✅ プロセスが正常終了またはユーザーによって切断されました。")
@@ -381,8 +413,6 @@ def run_claude_with_auto_retry():
                     log("✅ 待機中にプロセスが終了しました。")
                     break
 
-                # WHY: Claude Code は Rate Limit 時にメニューを表示する。
-                # ESCでメニュー状態から抜ける。
                 os.write(child.child_fd, b'\x1b')
                 time.sleep(2.0)
 
