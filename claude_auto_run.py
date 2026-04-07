@@ -1,11 +1,11 @@
 """
-Claude Code 自動復旧スクリプト v3.4
+Claude Code 自動復旧スクリプト v3.5
 select() ベースの自前I/Oループで、TUI対話とRate Limit自動復旧を両立する。
 Claudeが承認を求めて停止した場合も自動応答して作業を完遂させる。
 
 アーキテクチャ:
   interactive_loop() → select([child_fd, stdin_fd], timeout=0.5)
-    ├─ child_fd ready  → read → check_rate_limit → write to stdout
+    ├─ child_fd ready  → read → RateLimitDetector.feed()
     │                    → detect ❯ → inject pending prompt
     │                    → detect ❯ (再出現) → auto-approve
     ├─ stdin_fd ready  → read → write to child_fd
@@ -38,51 +38,93 @@ BACKOFF_MAX_SECONDS = 600
 SELECT_TIMEOUT = 0.5
 
 # WHY: プロンプト注入後、Claudeが承認を求めて ❯ を再表示した場合に自動応答する。
-# 連続自動応答の上限を設けて無限ループを防止する。
-MAX_AUTO_APPROVALS = 5
+# 上限なしで完全自動応答する（rate limit検知で自動停止するため無限ループにはならない）。
 AUTO_APPROVE_MSG = "はい、承認します。全て自動判断で最後まで進めてください。確認は不要です。"
 
 ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-RATE_LIMIT_TIME_RE = re.compile(
-    r'(?:Resets at|resets|Resets in)\s+(.+?)(?:\s*\(|·|\||$)',
-    re.IGNORECASE
-)
-RATE_LIMIT_GENERIC_RE = re.compile(
-    r'(429 Too Many Requests|rate limit|hit your limit|usage limit|limit reached|5-hour limit)',
-    re.IGNORECASE
-)
-# WHY: ステータスバーの「You've used 90% of your session limit · resets 8pm」は
-# rate limitではなく使用率の表示。これを誤検知しないように除外する。
-# "resets Xpm" 部分まで含めて除去しないと、残った "resets 8pm" がTIMEパターンに誤マッチする。
-USAGE_PERCENT_RE = re.compile(
-    r"you've used \d+%\s+of your session limit[^\n]*",
-    re.IGNORECASE
-)
-
-_RATE_LIMIT_KEYWORDS = ('rate', 'limit', '429', 'resets', 'hit your')
-
-# パーミッションダイアログ検知用キーワード
-_PERMISSION_KEYWORDS = ('do you want to proceed', 'requested permissions')
 
 # 自律実行指示（全プロンプトの末尾に付加）
 AUTONOMOUS_SUFFIX = " 承認確認は不要です。全て自動判断で最後まで進めてください。"
 
+# パーミッションダイアログ検知用キーワード
+_PERMISSION_KEYWORDS = ('do you want to proceed', 'requested permissions')
+
+DEFAULT_RECOVERY_PROMPT = "/session-recover /assemble-team"
+
+
 # ==========================================
-# Rate Limit 検知状態
+# RateLimitDetector: Rate Limit検知をカプセル化
 # ==========================================
 
-_rate_limit_detected = False
-_rate_limit_type = None
-_rate_limit_value = ""
-_output_buffer = ""
+class RateLimitDetector:
+    """
+    子プロセス出力をバッファに蓄積し、Rate Limitパターンを検知する。
+
+    WHY: グローバル変数による状態管理を排除し、テスト容易性と
+    再利用性を向上させる。reset()で状態をクリアしてリトライに備える。
+    """
+
+    _TIME_RE = re.compile(
+        r'(?:Resets at|resets|Resets in)\s+(.+?)(?:\s*\(|·|\||$)',
+        re.IGNORECASE,
+    )
+    _GENERIC_RE = re.compile(
+        r'(429 Too Many Requests|rate limit|hit your limit|usage limit|limit reached|5-hour limit)',
+        re.IGNORECASE,
+    )
+    # WHY: ステータスバーの「You've used 90% of your session limit · resets 8pm」は
+    # rate limitではなく使用率の表示。これを誤検知しないように除外する。
+    _USAGE_PERCENT_RE = re.compile(
+        r"you've used \d+%\s+of your session limit[^\n]*",
+        re.IGNORECASE,
+    )
+    _KEYWORDS = ('rate', 'limit', '429', 'resets', 'hit your')
+    _BUFFER_MAX = 2000
+
+    def __init__(self):
+        self.detected = False
+        self.type = None       # "TIME" | "GENERIC" | None
+        self.value = ""        # TIMEの場合のリセット時刻文字列
+        self._buffer = ""
+
+    def reset(self):
+        self.detected = False
+        self.type = None
+        self.value = ""
+        self._buffer = ""
+
+    def feed(self, data_bytes: bytes) -> None:
+        """出力データを受け取り、Rate Limitパターンを検査する。"""
+        text = data_bytes.decode('utf-8', errors='replace')
+
+        self._buffer += text
+        if len(self._buffer) > self._BUFFER_MAX:
+            self._buffer = self._buffer[-self._BUFFER_MAX:]
+
+        # WHY: 全出力に正規表現を適用するのはコストが高いため、
+        # まずキーワードで高速フィルタリングする。
+        if not any(kw in text.lower() for kw in self._KEYWORDS):
+            return
+
+        clean = ANSI_ESCAPE_RE.sub('', self._buffer)
+        # 使用率表示行を除外してからパターンマッチする
+        clean = self._USAGE_PERCENT_RE.sub('', clean)
+
+        m = self._TIME_RE.search(clean)
+        if m:
+            self.type = "TIME"
+            self.value = m.group(1).strip()
+            self.detected = True
+            return
+
+        if self._GENERIC_RE.search(clean):
+            self.type = "GENERIC"
+            self.value = ""
+            self.detected = True
 
 
-def reset_rate_limit_state():
-    global _rate_limit_detected, _rate_limit_type, _rate_limit_value, _output_buffer
-    _rate_limit_detected = False
-    _rate_limit_type = None
-    _rate_limit_value = ""
-    _output_buffer = ""
+# モジュールレベルのdetectorインスタンス（interactive_loop / run_claude_with_auto_retryが共有）
+_detector = RateLimitDetector()
 
 
 # ==========================================
@@ -92,6 +134,20 @@ def reset_rate_limit_state():
 def log(msg: str) -> None:
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{ts}] {msg}")
+
+
+def send_input(fd: int, message: bytes) -> None:
+    """
+    子プロセスにメッセージ＋Enter×2を送信する。
+
+    WHY: プロンプト注入・自動応答・パーミッション承認で同じ送信パターンが
+    繰り返されていたため、単一関数に統合して重複を排除する。
+    """
+    os.write(fd, message)
+    time.sleep(0.3)
+    os.write(fd, b'\r')
+    time.sleep(0.3)
+    os.write(fd, b'\r')
 
 
 def calc_wait_seconds(reset_time_str: str) -> int:
@@ -191,50 +247,6 @@ def parse_args() -> tuple:
 
 
 # ==========================================
-# 出力監視
-# ==========================================
-
-def check_rate_limit(data_bytes):
-    """
-    子プロセス出力をバッファに蓄積し、Rate Limitパターンを検知する。
-    WHY: 例外を投げずフラグを立てるだけにすることで、
-    I/Oループのtry/finallyによるTTY復元を妨げない。
-    """
-    global _output_buffer, _rate_limit_detected, _rate_limit_type, _rate_limit_value
-
-    text = data_bytes.decode('utf-8', errors='replace')
-
-    text_lower = text.lower()
-    needs_full_check = any(kw in text_lower for kw in _RATE_LIMIT_KEYWORDS)
-
-    _output_buffer += text
-    if len(_output_buffer) > 2000:
-        _output_buffer = _output_buffer[-2000:]
-
-    if not needs_full_check:
-        return
-
-    clean_buf = ANSI_ESCAPE_RE.sub('', _output_buffer)
-
-    # WHY: ステータスバーの使用率表示（例: "You've used 90% of your session limit · resets 8pm"）
-    # に含まれる "resets 8pm" を誤検知しないよう、使用率表示行を除外してからパターンマッチする。
-    clean_buf_filtered = USAGE_PERCENT_RE.sub('', clean_buf)
-
-    m = RATE_LIMIT_TIME_RE.search(clean_buf_filtered)
-    if m:
-        _rate_limit_type = "TIME"
-        _rate_limit_value = m.group(1).strip()
-        _rate_limit_detected = True
-        return
-
-    m2 = RATE_LIMIT_GENERIC_RE.search(clean_buf_filtered)
-    if m2:
-        _rate_limit_type = "GENERIC"
-        _rate_limit_value = ""
-        _rate_limit_detected = True
-
-
-# ==========================================
 # 自前 I/O ループ（プロンプト注入 + 自動応答機能付き）
 # ==========================================
 
@@ -256,7 +268,6 @@ def interactive_loop(child, pending_prompt=None):
     prompt_injected = False
     prompt_ready_counter = -1  # -1 = ❯ 未検知
 
-    # 自動応答: プロンプト注入後に ❯ が再出現した場合の処理
     auto_approve_count = 0
     # WHY: ❯ 検知後すぐに応答せず、Claudeが完全に出力を終えるまで待つ。
     # 処理中の中間出力に ❯ が含まれる場合の誤検知を防ぐ。
@@ -268,7 +279,7 @@ def interactive_loop(child, pending_prompt=None):
         tty.setraw(stdin_fd)
 
         while child.isalive():
-            if _rate_limit_detected:
+            if _detector.detected:
                 return "RATE_LIMIT"
 
             # --- Phase 1: 初回プロンプト注入 ---
@@ -276,11 +287,7 @@ def interactive_loop(child, pending_prompt=None):
                 prompt_ready_counter += 1
                 if prompt_ready_counter >= 3:
                     full_prompt = pending_prompt + AUTONOMOUS_SUFFIX
-                    os.write(child_fd, full_prompt.encode('utf-8'))
-                    time.sleep(0.3)
-                    os.write(child_fd, b'\r')
-                    time.sleep(0.3)
-                    os.write(child_fd, b'\r')
+                    send_input(child_fd, full_prompt.encode('utf-8'))
                     prompt_injected = True
                     log("📤 プロンプトを送信しました。")
 
@@ -288,16 +295,9 @@ def interactive_loop(child, pending_prompt=None):
             if prompt_injected and auto_approve_idle_cycles > 0:
                 auto_approve_idle_cycles += 1
                 if auto_approve_idle_cycles >= IDLE_THRESHOLD:
-                    if auto_approve_count < MAX_AUTO_APPROVALS:
-                        auto_approve_count += 1
-                        log(f"🤖 自動応答 #{auto_approve_count}: Claudeが入力待ちのため承認を送信")
-                        os.write(child_fd, AUTO_APPROVE_MSG.encode('utf-8'))
-                        time.sleep(0.3)
-                        os.write(child_fd, b'\r')
-                        time.sleep(0.3)
-                        os.write(child_fd, b'\r')
-                    else:
-                        log(f"⚠️ 自動応答上限({MAX_AUTO_APPROVALS}回)に達しました。手動入力をお待ちします。")
+                    auto_approve_count += 1
+                    log(f"🤖 自動応答 #{auto_approve_count}: Claudeが入力待ちのため承認を送信")
+                    send_input(child_fd, AUTO_APPROVE_MSG.encode('utf-8'))
                     auto_approve_idle_cycles = 0
 
             try:
@@ -316,15 +316,14 @@ def interactive_loop(child, pending_prompt=None):
                 if not data:
                     return "EXIT"
 
-                check_rate_limit(data)
+                _detector.feed(data)
 
                 clean = ANSI_ESCAPE_RE.sub('', data.decode('utf-8', errors='replace'))
                 clean_lower = clean.lower()
 
                 # --- パーミッションダイアログの自動承認 ---
                 # WHY: --dangerously-skip-permissions でも "sensitive file" 系の
-                # パーミッション確認は表示される。メニュー形式（1. Yes / 2. ... / 3. No）
-                # なのでEnterキーのみ送信してデフォルト選択（Yes）を実行する。
+                # パーミッション確認は表示される。Enterキーでデフォルト選択(Yes)を実行する。
                 if any(kw in clean_lower for kw in _PERMISSION_KEYWORDS):
                     log("🔓 パーミッション確認を自動承認")
                     time.sleep(0.5)
@@ -337,18 +336,13 @@ def interactive_loop(child, pending_prompt=None):
 
                 # Phase 2: プロンプト注入済みで ❯ 再出現 → 自動応答カウント開始
                 if prompt_injected and '❯' in clean:
-                    auto_approve_idle_cycles = 1  # カウント開始
+                    auto_approve_idle_cycles = 1
 
                 # 出力があったらアイドルカウントをリセット
                 if auto_approve_idle_cycles > 0 and '❯' not in clean and len(clean.strip()) > 0:
                     auto_approve_idle_cycles = 0
 
                 os.write(stdout_fd, data)
-
-            else:
-                # child_fd からの出力がない（タイムアウト）→ アイドルサイクル加算
-                # WHY: ❯ 検知後に出力が止まった = Claudeがユーザー入力を待っている
-                pass
 
             if stdin_fd in r:
                 try:
@@ -358,7 +352,6 @@ def interactive_loop(child, pending_prompt=None):
                 if not data:
                     return "EXIT"
 
-                # ユーザーが手動入力したら自動応答カウントをリセット
                 auto_approve_idle_cycles = 0
                 os.write(child_fd, data)
 
@@ -369,11 +362,47 @@ def interactive_loop(child, pending_prompt=None):
 
 
 # ==========================================
-# メインループ
+# Rate Limit 待機処理
 # ==========================================
 
-DEFAULT_RECOVERY_PROMPT = "/session-recover /assemble-team"
+def _handle_rate_limit_wait(child, retry_count: int) -> int:
+    """
+    Rate Limit検知後の待機処理。待機秒数を計算し、sleep後にリトライ番号を返す。
 
+    WHY: run_claude_with_auto_retry() から待機ロジックを抽出して
+    メインループのネストを浅くし、可読性を向上させる。
+    """
+    if _detector.type == "TIME":
+        wait_time = calc_wait_seconds(_detector.value)
+        log(f"\n⚠️ [検知] サブスクリプション制限に達しました。リセット予定: {_detector.value}")
+        wait_and_log(wait_time, retry_count)
+    else:
+        log(f"\n⚠️ [検知] Rate Limit が発生しました。リセット時刻を探索中...")
+        try:
+            time_idx = child.expect([
+                r'resets?\s+(?:at\s+|in\s+)?(\d{1,2}(?::\d{2})?\s*[apAP][mM])',
+                r'\r?\n',
+                pexpect.TIMEOUT
+            ], timeout=3)
+
+            if time_idx == 0:
+                reset_time_str = child.match.group(1).strip()
+                wait_time = calc_wait_seconds(reset_time_str)
+                log(f"🕐 リセット時刻を検出: {reset_time_str}")
+                wait_and_log(wait_time, retry_count)
+            else:
+                backoff = calc_backoff(retry_count)
+                log(f"⏳ リセット時刻不明。{backoff}秒間の Exponential Backoff...（リトライ #{retry_count + 1}/{MAX_RETRIES}）")
+                time.sleep(backoff)
+        except Exception:
+            backoff = calc_backoff(retry_count)
+            log(f"⏳ {backoff}秒間の Exponential Backoff...（リトライ #{retry_count + 1}/{MAX_RETRIES}）")
+            time.sleep(backoff)
+
+
+# ==========================================
+# メインループ
+# ==========================================
 
 def run_claude_with_auto_retry():
     cmd, initial_prompt = parse_args()
@@ -382,7 +411,7 @@ def run_claude_with_auto_retry():
         initial_prompt = DEFAULT_RECOVERY_PROMPT
         log(f"📝 -p 未指定。デフォルトプロンプト: {initial_prompt}")
 
-    log(f"🚀 [Claude Auto-Recovery v3.4] Starting: {cmd}")
+    log(f"🚀 [Claude Auto-Recovery v3.5] Starting: {cmd}")
     log(f"📝 初回プロンプト: {initial_prompt[:80]}...")
 
     child = pexpect.spawn(cmd[0], cmd[1:], encoding='utf-8', timeout=None)
@@ -393,7 +422,7 @@ def run_claude_with_auto_retry():
 
     try:
         while retry_count < MAX_RETRIES:
-            reset_rate_limit_state()
+            _detector.reset()
 
             try:
                 result = interactive_loop(child, pending_prompt=next_prompt)
@@ -403,35 +432,8 @@ def run_claude_with_auto_retry():
                     log("✅ プロセスが正常終了またはユーザーによって切断されました。")
                     break
 
-                # Rate Limit 検知
-                if _rate_limit_type == "TIME":
-                    wait_time = calc_wait_seconds(_rate_limit_value)
-                    log(f"\n⚠️ [検知] サブスクリプション制限に達しました。リセット予定: {_rate_limit_value}")
-                    wait_and_log(wait_time, retry_count)
-                else:
-                    log(f"\n⚠️ [検知] Rate Limit が発生しました。リセット時刻を探索中...")
-                    try:
-                        time_idx = child.expect([
-                            r'resets?\s+(?:at\s+|in\s+)?(\d{1,2}(?::\d{2})?\s*[apAP][mM])',
-                            r'\r?\n',
-                            pexpect.TIMEOUT
-                        ], timeout=3)
+                _handle_rate_limit_wait(child, retry_count)
 
-                        if time_idx == 0:
-                            reset_time_str = child.match.group(1).strip()
-                            wait_time = calc_wait_seconds(reset_time_str)
-                            log(f"🕐 リセット時刻を検出: {reset_time_str}")
-                            wait_and_log(wait_time, retry_count)
-                        else:
-                            backoff = calc_backoff(retry_count)
-                            log(f"⏳ リセット時刻不明。{backoff}秒間の Exponential Backoff...（リトライ #{retry_count + 1}/{MAX_RETRIES}）")
-                            time.sleep(backoff)
-                    except Exception:
-                        backoff = calc_backoff(retry_count)
-                        log(f"⏳ {backoff}秒間の Exponential Backoff...（リトライ #{retry_count + 1}/{MAX_RETRIES}）")
-                        time.sleep(backoff)
-
-                # 復旧アクション
                 if not child.isalive():
                     log("✅ 待機中にプロセスが終了しました。")
                     break

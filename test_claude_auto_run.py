@@ -120,120 +120,120 @@ class TestCalcBackoff:
 
 
 # ==========================================
-# check_rate_limit: Rate Limit 検知
+# RateLimitDetector: Rate Limit 検知
 # ==========================================
 
-class TestCheckRateLimit:
-    """check_rate_limit のテスト"""
+class TestRateLimitDetector:
+    """RateLimitDetector のテスト"""
 
     def setup_method(self):
-        car.reset_rate_limit_state()
+        self.detector = car.RateLimitDetector()
 
     def test_no_rate_limit(self):
         """通常出力 → 検知なし"""
-        car.check_rate_limit(b"Hello, this is normal output")
-        assert car._rate_limit_detected is False
+        self.detector.feed(b"Hello, this is normal output")
+        assert self.detector.detected is False
 
     def test_detect_resets_time(self):
         """'resets 3pm' パターンを検知"""
-        car.check_rate_limit(b"You've hit your limit - resets 3pm (Asia/Tokyo)")
-        assert car._rate_limit_detected is True
-        assert car._rate_limit_type == "TIME"
-        assert car._rate_limit_value == "3pm"
+        self.detector.feed(b"You've hit your limit - resets 3pm (Asia/Tokyo)")
+        assert self.detector.detected is True
+        assert self.detector.type == "TIME"
+        assert self.detector.value == "3pm"
 
     def test_detect_resets_at_time(self):
         """'Resets at 1am' パターンを検知"""
-        car.check_rate_limit(b"Resets at 1am")
-        assert car._rate_limit_detected is True
-        assert car._rate_limit_type == "TIME"
-        assert "1am" in car._rate_limit_value
+        self.detector.feed(b"Resets at 1am")
+        assert self.detector.detected is True
+        assert self.detector.type == "TIME"
+        assert "1am" in self.detector.value
 
     def test_detect_429(self):
         """'429 Too Many Requests' を検知"""
-        car.check_rate_limit(b"Error: 429 Too Many Requests")
-        assert car._rate_limit_detected is True
-        assert car._rate_limit_type == "GENERIC"
+        self.detector.feed(b"Error: 429 Too Many Requests")
+        assert self.detector.detected is True
+        assert self.detector.type == "GENERIC"
 
     def test_detect_hit_your_limit(self):
         """'hit your limit' を検知"""
-        car.check_rate_limit(b"You've hit your limit")
-        assert car._rate_limit_detected is True
-        assert car._rate_limit_type == "GENERIC"
+        self.detector.feed(b"You've hit your limit")
+        assert self.detector.detected is True
+        assert self.detector.type == "GENERIC"
 
     def test_detect_usage_limit(self):
         """'usage limit' を検知"""
-        car.check_rate_limit(b"You've reached the usage limit")
-        assert car._rate_limit_detected is True
-        assert car._rate_limit_type == "GENERIC"
+        self.detector.feed(b"You've reached the usage limit")
+        assert self.detector.detected is True
+        assert self.detector.type == "GENERIC"
 
     def test_detect_5_hour_limit(self):
         """'5-hour limit' を検知"""
-        car.check_rate_limit(b"5-hour limit reached")
-        assert car._rate_limit_detected is True
-        assert car._rate_limit_type == "GENERIC"
+        self.detector.feed(b"5-hour limit reached")
+        assert self.detector.detected is True
+        assert self.detector.type == "GENERIC"
 
     def test_ansi_escape_stripped(self):
         """ANSIエスケープシーケンスを除去して検知"""
         data = b"\x1b[31mYou've hit your limit\x1b[0m - resets 5am"
-        car.check_rate_limit(data)
-        assert car._rate_limit_detected is True
-        assert car._rate_limit_type == "TIME"
+        self.detector.feed(data)
+        assert self.detector.detected is True
+        assert self.detector.type == "TIME"
 
     def test_two_stage_filter_skips_unrelated(self):
         """キーワードを含まない出力 → フルバッファ検査をスキップ"""
-        car.check_rate_limit(b"normal output without keywords")
-        assert car._rate_limit_detected is False
+        self.detector.feed(b"normal output without keywords")
+        assert self.detector.detected is False
         # バッファには蓄積されている
-        assert "normal output" in car._output_buffer
+        assert "normal output" in self.detector._buffer
 
     def test_buffer_truncation(self):
         """バッファが2000文字でトランケートされる"""
         large_data = b"x" * 3000
-        car.check_rate_limit(large_data)
-        assert len(car._output_buffer) == 2000
+        self.detector.feed(large_data)
+        assert len(self.detector._buffer) == 2000
 
     def test_time_pattern_takes_priority(self):
         """TIMEパターンがGENERICより優先される"""
-        car.check_rate_limit(b"hit your limit - resets 3pm")
-        assert car._rate_limit_type == "TIME"
-        assert car._rate_limit_value == "3pm"
+        self.detector.feed(b"hit your limit - resets 3pm")
+        assert self.detector.type == "TIME"
+        assert self.detector.value == "3pm"
 
-    def test_reset_state(self):
-        """reset_rate_limit_state で状態がクリアされる"""
-        car.check_rate_limit(b"429 Too Many Requests")
-        assert car._rate_limit_detected is True
+    def test_reset(self):
+        """reset() で状態がクリアされる"""
+        self.detector.feed(b"429 Too Many Requests")
+        assert self.detector.detected is True
 
-        car.reset_rate_limit_state()
-        assert car._rate_limit_detected is False
-        assert car._rate_limit_type is None
-        assert car._rate_limit_value == ""
-        assert car._output_buffer == ""
+        self.detector.reset()
+        assert self.detector.detected is False
+        assert self.detector.type is None
+        assert self.detector.value == ""
+        assert self.detector._buffer == ""
 
     def test_usage_percent_not_detected(self):
         """ステータスバーの使用率表示を誤検知しない"""
-        car.check_rate_limit(
+        self.detector.feed(
             b"You've used 90% of your session limit \xc2\xb7 resets 8pm (Asia/Tokyo)"
         )
-        assert car._rate_limit_detected is False
+        assert self.detector.detected is False
 
     def test_usage_percent_50_not_detected(self):
         """50%の使用率表示を誤検知しない"""
-        car.check_rate_limit(
+        self.detector.feed(
             b"You've used 50% of your session limit \xc2\xb7 resets 8pm"
         )
-        assert car._rate_limit_detected is False
+        assert self.detector.detected is False
 
     def test_real_rate_limit_still_detected_after_percent(self):
         """使用率表示の後に本当のrate limitが来た場合は検知する"""
-        car.check_rate_limit(
+        self.detector.feed(
             b"You've used 90% of your session limit \xc2\xb7 resets 8pm"
         )
-        assert car._rate_limit_detected is False
-        # バッファをリセットして本物のrate limitを送信
-        car.reset_rate_limit_state()
-        car.check_rate_limit(b"You've hit your limit - resets 8pm")
-        assert car._rate_limit_detected is True
-        assert car._rate_limit_type == "TIME"
+        assert self.detector.detected is False
+        # リセットして本物のrate limitを送信
+        self.detector.reset()
+        self.detector.feed(b"You've hit your limit - resets 8pm")
+        assert self.detector.detected is True
+        assert self.detector.type == "TIME"
 
 
 # ==========================================
