@@ -39,17 +39,17 @@ SELECT_TIMEOUT = 0.5
 
 # WHY: プロンプト注入後、Claudeが承認を求めて ❯ を再表示した場合に自動応答する。
 # 上限なしで完全自動応答する（rate limit検知で自動停止するため無限ループにはならない）。
-AUTO_APPROVE_MSG = "/compact はい、承認します。全て自動判断で最後まで進めてください。確認は不要です。"
+AUTO_APPROVE_MSG = "はい、承認します。全て自動判断で最後まで進めてください。確認は不要です。"
 
 ANSI_ESCAPE_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 # 自律実行指示（全プロンプトの末尾に付加）
-AUTONOMOUS_SUFFIX = "/compact 承認確認は不要です。全て自動判断で最後まで進めてください。"
+AUTONOMOUS_SUFFIX = "承認確認は不要です。全て自動判断で最後まで進めてください。"
 
 # パーミッションダイアログ検知用キーワード
 _PERMISSION_KEYWORDS = ('do you want to proceed', 'requested permissions')
 
-DEFAULT_RECOVERY_PROMPT = "/compact /session-recover /assemble-team"
+DEFAULT_RECOVERY_PROMPT = "/session-recover /assemble-team"
 
 
 # ==========================================
