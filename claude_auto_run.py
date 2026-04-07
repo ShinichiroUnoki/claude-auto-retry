@@ -386,9 +386,7 @@ def run_claude_with_auto_retry():
                 os.write(child.child_fd, b'\x1b')
                 time.sleep(2.0)
 
-                # WHY: "Continue" だとESC直後の"C"がESCシーケンスとして消失する。
-                # "Please continue" にすることでESC+P（無害な未定義シーケンス）になり回避。
-                next_prompt = "/session-recover /assemble-team"
+                next_prompt = DEFAULT_RECOVERY_PROMPT
                 retry_count += 1
                 log(f"🔄 復旧準備完了。（リトライ #{retry_count}/{MAX_RETRIES}）")
 
