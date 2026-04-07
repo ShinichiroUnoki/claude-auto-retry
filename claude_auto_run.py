@@ -382,7 +382,7 @@ def run_claude_with_auto_retry():
 
                 # WHY: "Continue" だとESC直後の"C"がESCシーケンスとして消失する。
                 # "Please continue" にすることでESC+P（無害な未定義シーケンス）になり回避。
-                next_prompt = "Please continue the task."
+                next_prompt = "/session-recover /assemble-team"
                 retry_count += 1
                 log(f"🔄 復旧準備完了。（リトライ #{retry_count}/{MAX_RETRIES}）")
 
