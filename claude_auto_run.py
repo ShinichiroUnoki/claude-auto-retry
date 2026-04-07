@@ -86,9 +86,17 @@ def calc_wait_seconds(reset_time_str: str) -> int:
             ).replace(year=now.year, month=now.month, day=now.day)
 
             if reset_time <= now:
+                elapsed = (now - reset_time).total_seconds()
+                if elapsed < 3600:
+                    # WHY: リセット時刻が直近1時間以内の過去 → 既にリセット済み。
+                    # 例: 現在3:01pm、リセット3pm → 60秒待ってリトライすれば十分。
+                    log(f"🕐 リセット時刻 {reset_time_str} は{int(elapsed)}秒前に通過済み。短時間待機で再試行。")
+                    return 60
+                # 1時間以上前 → 翌日のリセットと解釈
                 reset_time += timedelta(days=1)
 
             diff = int((reset_time - now).total_seconds())
+            # マージン60秒を追加、最大4時間でキャップ
             return min(diff + 60, 14400)
         except ValueError:
             continue
@@ -370,10 +378,11 @@ def run_claude_with_auto_retry():
                 # WHY: Claude Code は Rate Limit 時にメニューを表示する。
                 # ESCでメニュー状態から抜ける。
                 os.write(child.child_fd, b'\x1b')
-                time.sleep(1.5)
+                time.sleep(2.0)
 
-                # 次のinteractive_loopで ❯ 検知後に復旧プロンプトを注入する
-                next_prompt = "Continue the task."
+                # WHY: "Continue" だとESC直後の"C"がESCシーケンスとして消失する。
+                # "Please continue" にすることでESC+P（無害な未定義シーケンス）になり回避。
+                next_prompt = "Please continue the task."
                 retry_count += 1
                 log(f"🔄 復旧準備完了。（リトライ #{retry_count}/{MAX_RETRIES}）")
 
