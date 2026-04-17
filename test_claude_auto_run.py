@@ -2,6 +2,7 @@
 
 import sys
 import os
+import time
 import pytest
 from unittest.mock import patch
 from datetime import datetime, timedelta
@@ -304,3 +305,60 @@ class TestAnsiEscapeRegex:
     def test_mixed(self):
         text = '\x1b[32m❯\x1b[0m hello'
         assert car.ANSI_ESCAPE_RE.sub('', text) == '❯ hello'
+
+
+# ==========================================
+# _drain_child_fd: PTYバッファ読み捨て
+# ==========================================
+
+class TestDrainChildFd:
+    """_drain_child_fd のテスト"""
+
+    def test_drains_available_data(self):
+        """データがある場合、全て読み捨てて終了する"""
+        r_fd, w_fd = os.pipe()
+        try:
+            os.write(w_fd, b"some stale output\r\n" * 10)
+            car._drain_child_fd(r_fd, timeout=1.0)
+            # drain後はバッファが空 → select で即 fd なし
+            import select as sel
+            ready, _, _ = sel.select([r_fd], [], [], 0)
+            assert ready == []
+        finally:
+            os.close(r_fd)
+            os.close(w_fd)
+
+    def test_returns_immediately_when_empty(self):
+        """バッファが空なら0.1秒以内に返る"""
+        r_fd, w_fd = os.pipe()
+        try:
+            start = time.time()
+            car._drain_child_fd(r_fd, timeout=1.0)
+            elapsed = time.time() - start
+            assert elapsed < 0.3  # 0.1秒で break するので余裕を持って 0.3s 以内
+        finally:
+            os.close(r_fd)
+            os.close(w_fd)
+
+    def test_handles_eof_gracefully(self):
+        """write端を閉じてEOFになっても例外を出さない"""
+        r_fd, w_fd = os.pipe()
+        os.write(w_fd, b"data")
+        os.close(w_fd)
+        # OSError(EIO) が発生してもクラッシュしない
+        car._drain_child_fd(r_fd, timeout=1.0)
+        os.close(r_fd)
+
+    def test_respects_timeout(self):
+        """連続データが来続けても timeout で抜ける"""
+        r_fd, w_fd = os.pipe()
+        try:
+            # タイムアウト前に大量書き込み（read側をブロックはしないが継続データを模倣）
+            os.write(w_fd, b"x" * 4096)
+            start = time.time()
+            car._drain_child_fd(r_fd, timeout=0.5)
+            elapsed = time.time() - start
+            assert elapsed < 1.0
+        finally:
+            os.close(r_fd)
+            os.close(w_fd)

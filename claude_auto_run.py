@@ -1,5 +1,5 @@
 """
-Claude Code 自動復旧スクリプト v3.5
+Claude Code 自動復旧スクリプト v3.6
 select() ベースの自前I/Oループで、TUI対話とRate Limit自動復旧を両立する。
 Claudeが承認を求めて停止した場合も自動応答して作業を完遂させる。
 
@@ -136,6 +136,19 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}")
 
 
+def log_raw(fd: int, msg: str) -> None:
+    """
+    raw modeのターミナル内からログを出力する。
+
+    WHY: tty.setraw() 中は行末の \n が \r\n に変換されないため、
+    通常の print() を使うと出力がスタイルしてしまう（staircase）。
+    os.write() で \r\n を明示することで正常に改行する。
+    """
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f"[{ts}] {msg}\r\n"
+    os.write(fd, line.encode('utf-8', errors='replace'))
+
+
 def send_input(fd: int, message: bytes) -> None:
     """
     子プロセスにメッセージ＋Enter×2を送信する。
@@ -184,6 +197,27 @@ def calc_backoff(retry_count: int) -> int:
 def wait_and_log(seconds: int, retry_count: int) -> None:
     log(f"⏳ {seconds}秒（約{seconds // 60}分）待機して再試行します...（リトライ #{retry_count + 1}/{MAX_RETRIES}）")
     time.sleep(seconds)
+
+
+def _drain_child_fd(fd: int, timeout: float = 2.0) -> None:
+    """
+    ptyバッファに蓄積された古い出力を読み捨てる。
+
+    WHY: Rate Limit待機中にClaude CodeのTUIが溜めたANSIエスケープシーケンスを
+    次のinteractive_loop開始前に破棄し、表示崩れとプロンプト検知失敗を防ぐ。
+    0.1秒間出力がなければバッファが空と判断して終了する。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if fd not in r:
+                break
+            data = os.read(fd, 4096)
+            if not data:
+                break
+        except OSError:
+            break
 
 
 # ==========================================
@@ -289,14 +323,14 @@ def interactive_loop(child, pending_prompt=None):
                     full_prompt = pending_prompt + AUTONOMOUS_SUFFIX
                     send_input(child_fd, full_prompt.encode('utf-8'))
                     prompt_injected = True
-                    log("📤 プロンプトを送信しました。")
+                    log_raw(stdout_fd, "📤 プロンプトを送信しました。")
 
             # --- Phase 2: 自動応答（Claudeが承認待ちで停止した場合） ---
             if prompt_injected and auto_approve_idle_cycles > 0:
                 auto_approve_idle_cycles += 1
                 if auto_approve_idle_cycles >= IDLE_THRESHOLD:
                     auto_approve_count += 1
-                    log(f"🤖 自動応答 #{auto_approve_count}: Claudeが入力待ちのため承認を送信")
+                    log_raw(stdout_fd, f"🤖 自動応答 #{auto_approve_count}: Claudeが入力待ちのため承認を送信")
                     send_input(child_fd, AUTO_APPROVE_MSG.encode('utf-8'))
                     auto_approve_idle_cycles = 0
 
@@ -325,7 +359,7 @@ def interactive_loop(child, pending_prompt=None):
                 # WHY: --dangerously-skip-permissions でも "sensitive file" 系の
                 # パーミッション確認は表示される。Enterキーでデフォルト選択(Yes)を実行する。
                 if any(kw in clean_lower for kw in _PERMISSION_KEYWORDS):
-                    log("🔓 パーミッション確認を自動承認")
+                    log_raw(stdout_fd, "🔓 パーミッション確認を自動承認")
                     time.sleep(0.5)
                     os.write(child_fd, b'\r')
 
@@ -365,9 +399,9 @@ def interactive_loop(child, pending_prompt=None):
 # Rate Limit 待機処理
 # ==========================================
 
-def _handle_rate_limit_wait(child, retry_count: int) -> int:
+def _handle_rate_limit_wait(child, retry_count: int) -> None:
     """
-    Rate Limit検知後の待機処理。待機秒数を計算し、sleep後にリトライ番号を返す。
+    Rate Limit検知後の待機処理。待機秒数を計算して sleep する。
 
     WHY: run_claude_with_auto_retry() から待機ロジックを抽出して
     メインループのネストを浅くし、可読性を向上させる。
@@ -377,27 +411,13 @@ def _handle_rate_limit_wait(child, retry_count: int) -> int:
         log(f"\n⚠️ [検知] サブスクリプション制限に達しました。リセット予定: {_detector.value}")
         wait_and_log(wait_time, retry_count)
     else:
-        log(f"\n⚠️ [検知] Rate Limit が発生しました。リセット時刻を探索中...")
-        try:
-            time_idx = child.expect([
-                r'resets?\s+(?:at\s+|in\s+)?(\d{1,2}(?::\d{2})?\s*[apAP][mM])',
-                r'\r?\n',
-                pexpect.TIMEOUT
-            ], timeout=3)
-
-            if time_idx == 0:
-                reset_time_str = child.match.group(1).strip()
-                wait_time = calc_wait_seconds(reset_time_str)
-                log(f"🕐 リセット時刻を検出: {reset_time_str}")
-                wait_and_log(wait_time, retry_count)
-            else:
-                backoff = calc_backoff(retry_count)
-                log(f"⏳ リセット時刻不明。{backoff}秒間の Exponential Backoff...（リトライ #{retry_count + 1}/{MAX_RETRIES}）")
-                time.sleep(backoff)
-        except Exception:
-            backoff = calc_backoff(retry_count)
-            log(f"⏳ {backoff}秒間の Exponential Backoff...（リトライ #{retry_count + 1}/{MAX_RETRIES}）")
-            time.sleep(backoff)
+        # WHY: interactive_loop が child_fd を os.read() で直接消費済みのため、
+        # child.expect() でリセット時刻を後から探索しても必ずタイムアウトになる。
+        # リセット時刻は RateLimitDetector がリアルタイムに解析するため、
+        # ここでは潔く Exponential Backoff にフォールバックする。
+        backoff = calc_backoff(retry_count)
+        log(f"\n⚠️ [検知] Rate Limit が発生しました（リセット時刻不明）。{backoff}秒の Exponential Backoff...（リトライ #{retry_count + 1}/{MAX_RETRIES}）")
+        time.sleep(backoff)
 
 
 # ==========================================
@@ -411,7 +431,7 @@ def run_claude_with_auto_retry():
         initial_prompt = DEFAULT_RECOVERY_PROMPT
         log(f"📝 -p 未指定。デフォルトプロンプト: {initial_prompt}")
 
-    log(f"🚀 [Claude Auto-Recovery v3.5] Starting: {cmd}")
+    log(f"🚀 [Claude Auto-Recovery v3.6] Starting: {cmd}")
     log(f"📝 初回プロンプト: {initial_prompt[:80]}...")
 
     child = pexpect.spawn(cmd[0], cmd[1:], encoding='utf-8', timeout=None)
@@ -438,8 +458,15 @@ def run_claude_with_auto_retry():
                     log("✅ 待機中にプロセスが終了しました。")
                     break
 
+                # WHY: 正しい順序は drain→ESC→即loop。
+                # 1) drain: 225分間のTUI更新でPTYバッファが4KB満杯になっている可能性があり、
+                #    Claudeのwrite()がブロック中かもしれない。drainでunblockしつつ古い出力を捨てる。
+                # 2) ESC: Rate Limitオーバーレイを閉じる正しいキー。\r(Enter)ではなく\x1b。
+                #    \rを使うと空メッセージとして送信されClaudeが不要な応答を生成してしまう。
+                # 3) 即interactive_loop: sleep不要。
+                #    loop内でリアルタイムにchild_fdを読むのでANSIシーケンスが噴出しない。
+                _drain_child_fd(child.child_fd, timeout=2.0)
                 os.write(child.child_fd, b'\x1b')
-                time.sleep(2.0)
 
                 next_prompt = DEFAULT_RECOVERY_PROMPT
                 retry_count += 1
