@@ -320,7 +320,7 @@ def interactive_loop(child, pending_prompt=None):
             if pending_prompt and not prompt_injected and prompt_ready_counter >= 0:
                 prompt_ready_counter += 1
                 if prompt_ready_counter >= 3:
-                    full_prompt = pending_prompt + AUTONOMOUS_SUFFIX
+                    full_prompt = pending_prompt + " " + AUTONOMOUS_SUFFIX
                     send_input(child_fd, full_prompt.encode('utf-8'))
                     prompt_injected = True
                     log_raw(stdout_fd, "📤 プロンプトを送信しました。")
